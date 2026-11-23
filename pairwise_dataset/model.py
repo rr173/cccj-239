@@ -50,6 +50,23 @@ class Cell:
     col_code: str = ""
 
 
+@dataclass(frozen=True)
+class GapEntry:
+    """补采工单中的一个缺口。
+
+    row/col 为排序位置（row < col）；required_batches 为该测点对命中多条
+    覆盖要求后取到的最大批次门槛；existing_batches 为现有证据中不同有效
+    批次的个数（同一批次的多条证据只算一次，不分原始方向）。
+    """
+
+    row: int
+    col: int
+    required_batches: int
+    existing_batches: int
+    row_code: str = ""
+    col_code: str = ""
+
+
 class WindowResult:
     """一次矩形窗口读取的结果。
 

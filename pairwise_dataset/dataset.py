@@ -365,6 +365,24 @@ class Snapshot:
     def version_seq(self):
         return self._v.seq
 
+    @property
+    def n_stations(self):
+        return self._v.n_stations
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def backfill(self, requirements):
+        """在本快照上建立补采工单（规则、版本与准备结果随之冻结）。
+
+        requirements 为至多 128 条 ``(a0, a1, b0, b1, k)``：从两个不相交的
+        非空半开区间各取一个测点组成的无序对，至少要有 k 个不同的有效批次。
+        """
+        from .workorder import build_work_order
+
+        return build_work_order(self, requirements)
+
     def window(self, r0, r1, c0, c1):
         """按排序位置给两个半开区间 [r0,r1) x [c0,c1)，交付其中有向单元。
 

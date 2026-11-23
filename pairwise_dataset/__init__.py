@@ -9,7 +9,14 @@ from .errors import (
     UnknownRecordError,
     ValidationError,
 )
-from .model import FORWARD, REVERSE, SELF, Cell, EvidenceRef, WindowResult
+from .model import FORWARD, REVERSE, SELF, Cell, EvidenceRef, GapEntry, WindowResult
+from .workorder import (
+    MAX_PAGE_SIZE,
+    MAX_REQUIREMENTS,
+    MIN_PAGE_SIZE,
+    GapPage,
+    WorkOrder,
+)
 
 __version__ = "0.1.0"
 
@@ -20,9 +27,15 @@ __all__ = [
     "Cell",
     "EvidenceRef",
     "WindowResult",
+    "GapEntry",
+    "GapPage",
+    "WorkOrder",
     "FORWARD",
     "REVERSE",
     "SELF",
+    "MAX_REQUIREMENTS",
+    "MIN_PAGE_SIZE",
+    "MAX_PAGE_SIZE",
     "DatasetError",
     "ValidationError",
     "ConflictError",
