@@ -9,9 +9,12 @@
                    原始方向标志、原始 d、原始 e）
     records.json   记录身份表（索引 = ev_rec 值）
     batches.json   批次表
+    stations.txt   本版本的测点代码顺序（行号 = 排序位置）；仅在与创建
+                   顺序不同的版本目录中存在，缺失时回退到根 stations.txt
 
 每个无序测点对只存一份规范方向的事实；反向读取在查询时折算，
-盘上不存在正反两份事实。
+盘上不存在正反两份事实。坐标（排序位置）按本版本自己的测点顺序解释：
+换版（重排）后的版本与旧版本各自使用各自的坐标。
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import os
 import sys
 from bisect import bisect_right
 
+from .errors import DatasetError
 from .model import EvidenceRef
 
 # 数组名 -> array typecode
@@ -58,14 +62,16 @@ def _fsync_dir(path):
 
 
 class Version:
-    """不可变版本：规范事实表 + 证据表 + k-d 树二维索引。"""
+    """不可变版本：测点顺序 + 规范事实表 + 证据表 + k-d 树二维索引。"""
 
-    def __init__(self, seq, n_stations, facts):
-        """facts: dict[(i,j)] -> (d, e, evs)，i<=j，evs 为
-        (record_id, batch, src, dst, raw_d, raw_e) 元组。"""
+    def __init__(self, seq, stations, facts):
+        """stations: 本版本的测点代码顺序（排序位置 0..N-1）。
+        facts: dict[(i,j)] -> (d, e, evs)，i<=j，坐标按本版本顺序；
+        evs 为 (record_id, batch, src, dst, raw_d, raw_e) 元组。"""
         _check_platform()
         self.seq = seq
-        self.n_stations = n_stations
+        self.stations = list(stations)
+        self.n_stations = len(self.stations)
         self.facts = facts
         self._build_arrays()
         self._build_tree()
@@ -229,7 +235,7 @@ class Version:
 
     # ------------------------------------------------------------------ 落盘
 
-    def save(self, dirpath):
+    def save(self, dirpath, write_stations=True):
         os.makedirs(dirpath, exist_ok=False)
         arrays = {
             "I": self.I,
@@ -258,6 +264,13 @@ class Version:
                 json.dump(table, f, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
+        if write_stations:
+            # 本版本顺序与创建顺序不同：把该版测点顺序随版本目录一起落盘
+            with open(os.path.join(dirpath, "stations.txt"), "w", encoding="utf-8") as f:
+                f.write("\n".join(self.stations))
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
         meta = {
             "format": FORMAT_VERSION,
             "seq": self.seq,
@@ -271,11 +284,22 @@ class Version:
         _fsync_dir(dirpath)
 
     @classmethod
-    def load(cls, dirpath, n_stations):
+    def load(cls, dirpath, root_stations):
+        """加载版本目录。root_stations 为根 stations.txt 的创建顺序：
+        版本目录没有自己的 stations.txt 时（旧格式或与创建顺序相同）
+        回退到创建顺序。"""
         with open(os.path.join(dirpath, "meta.json"), encoding="utf-8") as f:
             meta = json.load(f)
         if meta.get("format") != FORMAT_VERSION:
             raise RuntimeError(f"不支持的格式版本: {meta.get('format')}")
+        stations_file = os.path.join(dirpath, "stations.txt")
+        if os.path.isfile(stations_file):
+            with open(stations_file, encoding="utf-8") as f:
+                stations = f.read().splitlines()
+            if len(stations) != len(root_stations) or set(stations) != set(root_stations):
+                raise DatasetError(f"版本目录的测点顺序文件损坏: {stations_file}")
+        else:
+            stations = list(root_stations)
         _check_platform()
         big_endian = sys.byteorder == "big"
         arrays = {}
@@ -295,7 +319,8 @@ class Version:
 
         v = cls.__new__(cls)
         v.seq = meta["seq"]
-        v.n_stations = n_stations
+        v.stations = stations
+        v.n_stations = len(stations)
         v.I = arrays["I"]
         v.J = arrays["J"]
         v.D = arrays["D"]

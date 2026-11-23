@@ -1,11 +1,13 @@
 """可订正的落盘成对比测数据集。
 
-- 测点：创建时给定稳定且互不相同的代码，排序位置为 0..N-1 稠密下标，N<=1e8。
+- 测点：创建时给定稳定且互不相同的代码；每个版本各有一份测点顺序，
+  排序位置为 0..N-1 稠密下标，N<=1e8。reorder() 以现有代码的一份新
+  顺序发布坐标版本；坐标（排序位置）始终按所属版本的顺序解释。
 - 事实：有向记录 (a,b,d,e) 折算到规范方向（位置小->大）只存一份；
   反向读取折算 (-d, e)，盘上不存正反两份。
 - 首装与订正共用同一条事务路径：同对无论方向，只在折算值相同条件下
   合并证据；提交时校验剩余支持相互一致，冲突拒绝发布（不会用后面的行盖掉）。
-- MVCC：每次提交生成新的不可变版本目录并原子切换 CURRENT；
+- MVCC：每次提交（订正或换版）生成新的不可变版本目录并原子切换 CURRENT；
   读事务钉住开始时的版本，与写者并行也不会读出新旧混搭；
   只保留当前版本与被读事务钉住的版本，其余由 GC 清理。
 """
@@ -107,8 +109,8 @@ class Dataset:
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
-        v = Version(1, len(stations), {})
-        v.save(os.path.join(path, "versions", _version_name(1)))
+        v = Version(1, stations, {})
+        v.save(os.path.join(path, "versions", _version_name(1)), write_stations=False)
         _write_current(path, 1)
         ds = cls(path)
         if records:
@@ -132,14 +134,16 @@ class Dataset:
         with open(stations_file, encoding="utf-8") as f:
             self._stations = f.read().splitlines()
         _validate_stations(self._stations)
-        self._pos = {c: i for i, c in enumerate(self._stations)}
+        self._code_set = frozenset(self._stations)
         self._state_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._pins = {}
         self._closed = False
         self._current = self._load_current()
+        # 代码 -> 排序位置的映射跟随当前版本的测点顺序（换版后更新）
+        self._pos = {c: i for i, c in enumerate(self._current.stations)}
         # 追补状态：建立/读取追补起点（重开不重置），并清理切换 CURRENT 前
-        # 中断的订正留下的残留轮次文件
+        # 中断的订正/换版留下的残留轮次文件
         self._catchup_anchor = ensure_catchup_state(self._path, self._current.seq)
         # 清理非当前版本的残留目录（如崩溃留下的半成品）
         self._gc_locked()
@@ -153,13 +157,14 @@ class Dataset:
         vdir = os.path.join(self._path, "versions", name)
         if not os.path.isdir(vdir):
             raise DatasetError(f"CURRENT 指向的版本目录不存在: {name}")
-        return Version.load(vdir, len(self._stations))
+        return Version.load(vdir, self._stations)
 
     # ------------------------------------------------------------------ 属性
 
     @property
     def stations(self):
-        return tuple(self._stations)
+        """当前版本的测点代码顺序（换版后随当前版本变化）。"""
+        return tuple(self._current.stations)
 
     @property
     def n_stations(self):
@@ -235,7 +240,7 @@ class Dataset:
                 for _rid, _batch, pa, pb, rd, re_ in evs:
                     vals.add((rd if pa <= pb else -rd, re_))
                 if len(vals) != 1:
-                    ci, cj = self._stations[pair[0]], self._stations[pair[1]]
+                    ci, cj = base.stations[pair[0]], base.stations[pair[1]]
                     raise ConflictError(
                         f"测点对 ({ci!r},{cj!r}) 剩余证据折算值不一致: "
                         f"{sorted(vals)!r}，拒绝发布"
@@ -243,10 +248,90 @@ class Dataset:
                 d, e = vals.pop()
                 evs.sort(key=lambda ev: ev[0])
                 new_facts[pair] = (d, e, tuple(evs))
-            new_version = Version(base.seq + 1, len(self._stations), new_facts)
-            new_version.save(os.path.join(self._path, "versions", _version_name(new_version.seq)))
+            new_version = Version(base.seq + 1, base.stations, new_facts)
+            new_version.save(
+                os.path.join(self._path, "versions", _version_name(new_version.seq)),
+                write_stations=(base.stations != self._stations),
+            )
             # 追补记录与矩阵同轮生效：先在 CURRENT 切换前把本轮增撤原子落盘，
             # 使已发布的订正重开后仍可追补；切换前中断则残留文件随重开清理
+            write_round(self._path, new_version.seq, adds_delta, removes_delta)
+            self._publish(new_version)
+            self._gc_locked()
+            return new_version.seq
+
+    def reorder(self, new_order):
+        """以现有测点代码的一份新顺序发布坐标版本，返回新版本号。
+
+        只允许全量重排：new_order 必须恰好包含现有全部测点代码各一次，
+        否则报 ValidationError 且当前版本不变。与当前顺序相同则直接返回
+        当前版本号，不产生新版本、不占追补轮次。
+
+        重排不改变证据的记录身份、测点代码、原始采样方向、原始偏差/误差
+        与批次，只改变排序位置：矩阵正向（位置小->大）按新版位置解释，
+        按代码读有向值与换版前一致。换版与订正共用版本序列：成功换版后
+        之前开启的未提交订正按过期拒绝；一轮真正重排计入追补保留范围，
+        只换了位置的记录在追补中按两端版本坐标各交付一份。
+        """
+        if isinstance(new_order, (str, bytes)):
+            raise ValidationError("新顺序必须是测点代码的序列，而不是字符串")
+        try:
+            order = list(new_order)
+        except TypeError:
+            raise ValidationError("新顺序必须可迭代") from None
+        n = len(self._stations)
+        if len(order) != n:
+            raise ValidationError(
+                f"新顺序必须恰好包含全部 {n} 个测点代码，收到 {len(order)} 个"
+            )
+        seen = set()
+        for code in order:
+            if not isinstance(code, str) or not code:
+                raise ValidationError("测点代码必须为非空字符串")
+            if code not in self._code_set:
+                raise ValidationError(f"未知测点代码: {code!r}")
+            if code in seen:
+                raise ValidationError(f"测点代码重复: {code!r}")
+            seen.add(code)
+        with self._write_lock:
+            with self._state_lock:
+                self._ensure_open()
+                base = self._current
+            if order == base.stations:
+                # 相同顺序：直接返回当前版，不产生新版本
+                return base.seq
+            # 旧位置 -> 新位置（测点代码集合不变，只换坐标）
+            index_in_new = {code: q for q, code in enumerate(order)}
+            new_pos_of_old = [index_in_new[c] for c in base.stations]
+            # 只读测点表与已有证据重建事实表，不枚举缺测对
+            new_facts = {}
+            adds_delta = {}
+            removes_delta = {}
+            for (i, j), (d, e, evs) in base.facts.items():
+                ni = new_pos_of_old[i]
+                nj = new_pos_of_old[j]
+                new_evs = []
+                for rid, bat, pa, pb, rd, re_ in evs:
+                    qa = new_pos_of_old[pa]
+                    qb = new_pos_of_old[pb]
+                    new_evs.append((rid, bat, qa, qb, rd, re_))
+                    if (qa, qb) != (pa, pb):
+                        # 追补轮次：位置变化的记录按两端版本坐标各记一份
+                        adds_delta[rid] = (bat, qa, qb, rd, re_)
+                        removes_delta[rid] = (bat, pa, pb, rd, re_)
+                new_evs.sort(key=lambda ev: ev[0])
+                if ni <= nj:
+                    new_facts[(ni, nj)] = (d, e, tuple(new_evs))
+                else:
+                    # 规范方向随新版位置翻转，折算值取反
+                    new_facts[(nj, ni)] = (-d, e, tuple(new_evs))
+            new_version = Version(base.seq + 1, order, new_facts)
+            new_version.save(
+                os.path.join(self._path, "versions", _version_name(new_version.seq)),
+                write_stations=(order != self._stations),
+            )
+            # 与订正同轮生效：先在 CURRENT 切换前把本轮增撤原子落盘；
+            # 切换前中断的残留随重开清理，不改变坐标也不占用追补版本
             write_round(self._path, new_version.seq, adds_delta, removes_delta)
             self._publish(new_version)
             self._gc_locked()
@@ -256,6 +341,7 @@ class Dataset:
         _write_current(self._path, version.seq)
         with self._state_lock:
             self._current = version
+            self._pos = {c: i for i, c in enumerate(version.stations)}
 
     # ------------------------------------------------------------------ GC / 关闭
 
@@ -389,6 +475,11 @@ class Snapshot:
         return self._v.seq
 
     @property
+    def stations(self):
+        """本快照版本的测点代码顺序（排序位置 0..N-1 按此解释）。"""
+        return tuple(self._v.stations)
+
+    @property
     def n_stations(self):
         return self._v.n_stations
 
@@ -458,7 +549,7 @@ class Snapshot:
             tmp = []
             v.rect_query(c0, c1, r0, r1, tmp, stats)
             rev = [k for k in tmp if v.I[k] < v.J[k]]  # 对角只在正向计一次
-        stations = self._ds._stations
+        stations = v.stations
         cells = []
         for k in fwd:
             i = v.I[k]
@@ -494,7 +585,7 @@ class Snapshot:
         k = v.pair_index.get((i, j))
         if k is None:
             return None
-        stations = self._ds._stations
+        stations = v.stations
         ev = v.evidence_of(k)
         if row == col:
             return Cell(row, col, v.D[k], v.E[k], SELF, ev, stations[row], stations[col])

@@ -338,13 +338,14 @@ class WorkOrder:
                 lo = mid + 1
         row, col = self._key_at(ans)
         required = self._required_of(row, col)
+        stations = self._snap._v.stations
         return GapEntry(
             row,
             col,
             required,
             self._existing.get((row, col), 0),
-            self._snap._ds._stations[row],
-            self._snap._ds._stations[col],
+            stations[row],
+            stations[col],
         )
 
     def _seg_of(self, pos):
