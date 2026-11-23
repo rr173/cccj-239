@@ -1,5 +1,6 @@
 """可订正的落盘成对比测稀疏矩阵数据集。"""
 
+from .catchup import CATCHUP_WINDOW
 from .dataset import Correction, Dataset, Snapshot
 from .errors import (
     ConflictError,
@@ -9,7 +10,17 @@ from .errors import (
     UnknownRecordError,
     ValidationError,
 )
-from .model import FORWARD, REVERSE, SELF, Cell, EvidenceRef, GapEntry, WindowResult
+from .model import (
+    FORWARD,
+    REVERSE,
+    SELF,
+    CatchupChange,
+    CatchupResult,
+    Cell,
+    EvidenceRef,
+    GapEntry,
+    WindowResult,
+)
 from .workorder import (
     MAX_PAGE_SIZE,
     MAX_REQUIREMENTS,
@@ -30,6 +41,9 @@ __all__ = [
     "GapEntry",
     "GapPage",
     "WorkOrder",
+    "CatchupChange",
+    "CatchupResult",
+    "CATCHUP_WINDOW",
     "FORWARD",
     "REVERSE",
     "SELF",

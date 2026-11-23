@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 FORWARD = "forward"
 REVERSE = "reverse"
@@ -65,6 +65,49 @@ class GapEntry:
     existing_batches: int
     row_code: str = ""
     col_code: str = ""
+
+
+@dataclass(frozen=True)
+class CatchupChange:
+    """一条记录在一次追补跨度内的净变更。
+
+    old/new 为该记录 ID 在游标端/目标端的原始证据内容（EvidenceRef：
+    批次、原始方向的两个测点排序位置、原始偏差与误差，未折算）；
+    不存在的一端为 None。误差按数值比较（如 -0.0 与 0.0 视为相同）。
+    """
+
+    record_id: str
+    old: Optional[EvidenceRef]
+    new: Optional[EvidenceRef]
+
+
+class CatchupResult:
+    """一次追补的结果。
+
+    changes 按记录 ID 的字符串顺序交付，每个有差异的 ID 只出现一次；
+    to_seq 为目标快照版本号，可作为下次追补的游标；
+    stats 暴露本次追补处理的记录规模（用于验证不做整仓扫描）。
+    """
+
+    __slots__ = ("from_seq", "to_seq", "changes", "stats")
+
+    def __init__(self, from_seq, to_seq, changes, stats):
+        self.from_seq = from_seq
+        self.to_seq = to_seq
+        self.changes: Tuple[CatchupChange, ...] = tuple(changes)
+        self.stats = stats
+
+    def __len__(self):
+        return len(self.changes)
+
+    def __iter__(self):
+        return iter(self.changes)
+
+    def __repr__(self):
+        return (
+            f"CatchupResult(from_seq={self.from_seq}, to_seq={self.to_seq}, "
+            f"changes={len(self.changes)})"
+        )
 
 
 class WindowResult:

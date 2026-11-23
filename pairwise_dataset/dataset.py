@@ -17,6 +17,13 @@ import os
 import shutil
 import threading
 
+from .catchup import (
+    CATCHUP_WINDOW,
+    compute_catchup,
+    ensure_catchup_state,
+    gc_rounds,
+    write_round,
+)
 from .errors import (
     ConflictError,
     DatasetError,
@@ -131,6 +138,9 @@ class Dataset:
         self._pins = {}
         self._closed = False
         self._current = self._load_current()
+        # 追补状态：建立/读取追补起点（重开不重置），并清理切换 CURRENT 前
+        # 中断的订正留下的残留轮次文件
+        self._catchup_anchor = ensure_catchup_state(self._path, self._current.seq)
         # 清理非当前版本的残留目录（如崩溃留下的半成品）
         self._gc_locked()
 
@@ -189,19 +199,27 @@ class Dataset:
                 base = self._current
             if tx._base is not base:
                 raise StaleTransactionError("订正基于过期版本，请重新开启订正事务")
-            # 汇总受影响的测点对
+            # 汇总受影响的测点对，同时收集本轮证据增撤（追补记录，只处理本轮）
             touched = set()
+            removes_delta = {}
             for rid in tx._revokes:
                 t = base.rec_index[rid]  # revoke 时已校验存在
                 k = base.fact_of_entry(t)
-                touched.add((base.I[k], base.J[k]))
+                pair = (base.I[k], base.J[k])
+                touched.add(pair)
+                for ev in base.facts[pair][2]:
+                    if ev[0] == rid:
+                        removes_delta[rid] = ev[1:]  # 撤掉前的原始内容
+                        break
             adds_by_pair = {}
+            adds_delta = {}
             for rid, (batch, a, b, d, e) in tx._adds.items():
                 pa = self._pos[a]
                 pb = self._pos[b]
                 i, j = (pa, pb) if pa <= pb else (pb, pa)
                 adds_by_pair.setdefault((i, j), []).append((rid, batch, pa, pb, d, e))
                 touched.add((i, j))
+                adds_delta[rid] = (batch, pa, pb, d, e)
             new_facts = dict(base.facts)
             for pair in touched:
                 old = base.facts.get(pair)
@@ -227,6 +245,9 @@ class Dataset:
                 new_facts[pair] = (d, e, tuple(evs))
             new_version = Version(base.seq + 1, len(self._stations), new_facts)
             new_version.save(os.path.join(self._path, "versions", _version_name(new_version.seq)))
+            # 追补记录与矩阵同轮生效：先在 CURRENT 切换前把本轮增撤原子落盘，
+            # 使已发布的订正重开后仍可追补；切换前中断则残留文件随重开清理
+            write_round(self._path, new_version.seq, adds_delta, removes_delta)
             self._publish(new_version)
             self._gc_locked()
             return new_version.seq
@@ -248,15 +269,17 @@ class Dataset:
             keep = {self._current.seq}
             keep.update(seq for seq, cnt in self._pins.items() if cnt > 0)
         vroot = os.path.join(self._path, "versions")
-        if not os.path.isdir(vroot):
-            return
-        for name in os.listdir(vroot):
-            try:
-                seq = int(name.split("_", 1)[1])
-            except (IndexError, ValueError):
-                seq = None
-            if seq not in keep:
-                shutil.rmtree(os.path.join(vroot, name), ignore_errors=True)
+        if os.path.isdir(vroot):
+            for name in os.listdir(vroot):
+                try:
+                    seq = int(name.split("_", 1)[1])
+                except (IndexError, ValueError):
+                    seq = None
+                if seq not in keep:
+                    shutil.rmtree(os.path.join(vroot, name), ignore_errors=True)
+        # 追补历史：保留当前版本与各活动快照各自往前 CATCHUP_WINDOW 轮所需
+        # 的轮次文件；不为追补延期保留完整的历史矩阵目录
+        gc_rounds(self._path, keep)
 
     def close(self):
         with self._state_lock:
@@ -372,6 +395,39 @@ class Snapshot:
     @property
     def closed(self):
         return self._closed
+
+    def catchup(self, since_seq):
+        """在本快照上追补：给出把台账从 since_seq 版本追平到本快照的净变更。
+
+        since_seq 为同一数据集的上次同步版本号（游标）。返回 CatchupResult：
+        changes 按记录 ID 字符串序交付该跨度内的净变更（每个有差异的 ID
+        一条，old/new 为两端原始证据内容，不存在的一端为 None），to_seq
+        为本快照版本号，可作为下次游标。
+
+        游标须为本快照版本往前至多 CATCHUP_WINDOW（16）轮成功订正（含），
+        且不早于追补起点；从快照自身追补得到空差异。起点之前、超过保留
+        范围、比目标更新或非法的游标，以及已关闭的快照，都报错。
+        """
+        if self._closed:
+            raise DatasetError("读快照已关闭，不能追补")
+        ds = self._ds
+        target = self._v.seq
+        if not isinstance(since_seq, int) or isinstance(since_seq, bool):
+            raise ValidationError("追补游标必须为整数版本号")
+        if since_seq > target:
+            raise ValidationError(f"追补游标 {since_seq} 比目标快照版本 {target} 更新")
+        if since_seq < ds._catchup_anchor:
+            raise ValidationError(
+                f"追补游标 {since_seq} 早于追补起点 {ds._catchup_anchor}"
+            )
+        if target - since_seq > CATCHUP_WINDOW:
+            raise ValidationError(
+                f"追补游标超出保留范围：最多支持从目标版本往前 "
+                f"{CATCHUP_WINDOW} 轮成功订正"
+            )
+        with ds._state_lock:
+            current = ds._current
+        return compute_catchup(ds._path, since_seq, target, current)
 
     def backfill(self, requirements):
         """在本快照上建立补采工单（规则、版本与准备结果随之冻结）。
